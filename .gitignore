@@ -1,0 +1,16 @@
+# macOS / iCloud noise
+.DS_Store
+.Spotlight-V100
+.Trashes
+._*
+Icon?
+.claude/
+
+# Local-only encryption sources — NEVER commit these (they contain the plaintext recipes)
+app.src.html
+build-encrypt.js
+loader.template.html
+Recipe_Book_Compilation.pdf
+_*
+
+# Only the encrypted index.html is published.

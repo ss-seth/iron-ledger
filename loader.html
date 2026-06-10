@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black" />
+<meta name="apple-mobile-web-app-title" content="Iron Ledger" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="theme-color" content="#0a0a0a" />
+<link rel="manifest" href="manifest.json" />
+<link rel="apple-touch-icon" sizes="180x180" href="icon-180.png" />
+<link rel="icon" type="image/png" sizes="180x180" href="icon-180.png" />
+<title>Iron Ledger</title>
+<style>
+  :root { --accent:#c4ff00; --bg:#0a0a0a; --surface:#161616; --text:#f2f2f2; --text-dim:#8a8a8a; --border:#2a2a2a; --danger:#ff4d4d; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+  #lock { min-height:100%; display:flex; align-items:center; justify-content:center; padding:24px; }
+  .lock-card { width:100%; max-width:360px; text-align:center; }
+  .brand { font-weight:800; letter-spacing:0.08em; font-size:30px; margin:0 0 4px; }
+  .brand span { color:var(--accent); }
+  .tag { color:var(--text-dim); font-size:12px; letter-spacing:0.18em; text-transform:uppercase; margin-bottom:28px; }
+  label.lead { display:block; font-size:13px; color:var(--text-dim); margin-bottom:8px; text-align:left; }
+  input[type=password] { width:100%; padding:13px 14px; font-size:16px; background:var(--surface);
+    color:var(--text); border:1px solid var(--border); border-radius:8px; outline:none; }
+  input[type=password]:focus { border-color:var(--accent); }
+  .remember { display:flex; align-items:center; gap:8px; justify-content:flex-start; margin:14px 2px 18px;
+    font-size:13px; color:var(--text-dim); }
+  button.unlock { width:100%; padding:13px; font-size:15px; font-weight:700; letter-spacing:0.06em;
+    background:var(--accent); color:#0a0a0a; border:none; border-radius:8px; cursor:pointer; }
+  button.unlock:disabled { opacity:0.6; cursor:default; }
+  #err { color:var(--danger); font-size:13px; min-height:18px; margin-top:14px; }
+  .hint { color:var(--text-dim); font-size:11px; margin-top:22px; line-height:1.5; }
+</style>
+</head>
+<body>
+<div id="lock">
+  <div class="lock-card">
+    <h1 class="brand">IRON<span>·</span>LEDGER</h1>
+    <div class="tag">Locked</div>
+    <label class="lead" for="pw">Password</label>
+    <input type="password" id="pw" autocomplete="current-password" autocapitalize="off" autocorrect="off" placeholder="Enter password" />
+    <div class="remember"><input type="checkbox" id="remember" checked /> <label for="remember">Remember on this device</label></div>
+    <button class="unlock" id="unlock">Unlock</button>
+    <div id="err"></div>
+    <div class="hint">Your data stays on this device. This password protects the app contents; it isn't stored on any server — and with "remember" on, only a non-readable unlock key is kept here, never the password itself.</div>
+  </div>
+</div>
+<script>
+const PAYLOAD = "__PAYLOAD__";
+const ITER = __ITER__;
+const LEGACY_PW_KEY = 'iron-ledger:unlock';
+
+// Offline support: the service worker caches this (encrypted) page, the manifest,
+// icons and the encrypted cookbook so the app opens with no signal at the gym.
+if ('serviceWorker' in navigator) { navigator.serviceWorker.register('sw.js').catch(function(){}); }
+
+function b64d(s){ const bin=atob(s); const a=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) a[i]=bin.charCodeAt(i); return a; }
+
+async function deriveKey(pw, salt){
+  const mat = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveKey']);
+  // Non-extractable: safe to persist in IndexedDB for "remember me" — it can decrypt,
+  // but the password/key bytes can never be read back out.
+  return crypto.subtle.deriveKey({ name:'PBKDF2', salt, iterations:ITER, hash:'SHA-256' }, mat,
+    { name:'AES-GCM', length:256 }, false, ['decrypt']);
+}
+
+async function decryptWithKey(key, data){
+  const iv = data.slice(16,28), ct = data.slice(28);
+  const plain = await crypto.subtle.decrypt({ name:'AES-GCM', iv }, key, ct);
+  // Payload is gzipped before encryption to keep the page small.
+  const ds = new DecompressionStream('gzip');
+  const stream = new Blob([plain]).stream().pipeThrough(ds);
+  return await new Response(stream).text();
+}
+
+// ----- Remember-me: a non-extractable CryptoKey in IndexedDB (never the password) -----
+const KEYDB = 'iron-ledger-lock';
+function keyDb(){
+  return new Promise((res, rej) => {
+    const req = indexedDB.open(KEYDB, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore('keys');
+    req.onsuccess = () => res(req.result);
+    req.onerror = () => rej(req.error);
+  });
+}
+async function storeKey(key){
+  try {
+    const db = await keyDb();
+    await new Promise((res, rej) => {
+      const tx = db.transaction('keys','readwrite');
+      tx.objectStore('keys').put(key, 'unlock');
+      tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+    });
+    db.close();
+  } catch(e) {}
+}
+async function loadKey(){
+  try {
+    const db = await keyDb();
+    const key = await new Promise((res, rej) => {
+      const req = db.transaction('keys').objectStore('keys').get('unlock');
+      req.onsuccess = () => res(req.result || null);
+      req.onerror = () => rej(req.error);
+    });
+    db.close();
+    return key;
+  } catch(e) { return null; }
+}
+async function clearKey(){
+  try {
+    const db = await keyDb();
+    await new Promise(res => { const tx = db.transaction('keys','readwrite'); tx.objectStore('keys').delete('unlock'); tx.oncomplete = res; tx.onerror = res; });
+    db.close();
+  } catch(e) {}
+}
+
+function boot(html, key){
+  window.__IL_KEY = key; // survives document.write — the app uses it for cookbook.enc
+  document.open(); document.write(html); document.close();
+}
+
+const errEl = document.getElementById('err');
+const btn = document.getElementById('unlock');
+
+async function attempt(pw, remember, silent){
+  if(!pw) return;
+  btn.disabled = true; errEl.textContent = silent ? '' : 'Unlocking…';
+  try {
+    if (typeof DecompressionStream === 'undefined') { errEl.textContent = 'This browser is too old for Iron Ledger — please update it.'; return; }
+    const data = b64d(PAYLOAD);
+    const key = await deriveKey(pw, data.slice(0,16));
+    const html = await decryptWithKey(key, data);
+    if (remember) await storeKey(key);
+    try { localStorage.removeItem(LEGACY_PW_KEY); } catch(e) {}
+    boot(html, key);
+  } catch(e) {
+    btn.disabled = false; errEl.textContent = 'Wrong password';
+    clearKey();
+  }
+}
+
+btn.addEventListener('click', () => attempt(document.getElementById('pw').value, document.getElementById('remember').checked, false));
+document.getElementById('pw').addEventListener('keydown', e => { if(e.key==='Enter') btn.click(); });
+
+// Auto-unlock: stored CryptoKey first (fast — skips PBKDF2 entirely), then migrate
+// any plaintext password left behind by the previous version of this lock screen.
+(async function(){
+  try {
+    const key = await loadKey();
+    if (key) {
+      try {
+        boot(await decryptWithKey(key, b64d(PAYLOAD)), key);
+        return;
+      } catch(e) { await clearKey(); } // stale key (e.g. password or salt changed)
+    }
+    const legacyPw = localStorage.getItem(LEGACY_PW_KEY);
+    if (legacyPw) await attempt(legacyPw, true, true);
+  } catch(e) {}
+})();
+</script>
+</body>
+</html>
